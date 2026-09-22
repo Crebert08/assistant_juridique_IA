@@ -1,2 +1,4 @@
 .env
 rag
+__pycache__/
+venv/

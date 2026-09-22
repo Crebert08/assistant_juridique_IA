@@ -9,3 +9,5 @@ langchain_chroma
 langchainhub
 pypdf
 rapidocr-onnxruntime
+# TypeSafe Jev SDK - verify exact package name on docs.typesafe.ai
+typesafe-sdk
