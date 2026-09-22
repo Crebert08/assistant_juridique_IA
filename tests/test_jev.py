@@ -83,7 +83,8 @@ def fake_client(side_effect=None, return_value=None):
 # ---------- app/jev.py ----------
 class TestJevModule(unittest.TestCase):
     def test_contract_constants(self):
-        self.assertEqual(jev.RELEVANCE_ORDER, {"non": 0, "partiellement": 1, "oui": 2})
+        self.assertEqual(jev.SENSITIVITY_LEVELS, ["faible", "moyen", "élevé"])
+        self.assertEqual(jev.RELEVANCE_LEVELS, ["non", "partiellement", "oui"])
 
     def test_no_client_at_import(self):
         # _client must be None until get_client() is first called.
@@ -108,8 +109,32 @@ class TestJevModule(unittest.TestCase):
 
 
 class TestTriage(unittest.TestCase):
+    def _sensitivity(self, score):
+        client = fake_client(return_value=triage_result(0.9, score))
+        with patch.object(jev, "get_client", return_value=client):
+            return jev.triage("Q")[1]
+
+    def test_score_maps_to_nearest_level(self):
+        # Score is a probability-weighted level index (0..2), e.g. 0.24 from a real call.
+        self.assertEqual(self._sensitivity(0.24), "faible")
+        self.assertEqual(self._sensitivity(1.2), "moyen")
+        self.assertEqual(self._sensitivity(1.6), "élevé")
+
+    def test_sends_app_context_with_question(self):
+        # Without the Burundi context, real Jev scored "vol simple" 0.28 (refused).
+        client = fake_client(return_value=triage_result(0.9, 0.0))
+        with patch.object(jev, "get_client", return_value=client):
+            jev.triage("Quelle est la peine pour le vol simple ?")
+        state = extract_state(*client.system_one.call_args)
+        self.assertEqual(state["contexte"], jev.APP_CONTEXT)
+        self.assertEqual(state["question"], "Quelle est la peine pour le vol simple ?")
+
+    def test_score_out_of_range_is_clamped(self):
+        self.assertEqual(self._sensitivity(-0.7), "faible")
+        self.assertEqual(self._sensitivity(2.9), "élevé")
+
     def test_returns_noul_and_score(self):
-        client = fake_client(return_value=triage_result(0.83, "élevé"))
+        client = fake_client(return_value=triage_result(0.83, 2.0))
         with patch.object(jev, "get_client", return_value=client):
             in_scope, sensitivity = jev.triage("Quelle est la peine pour vol ?")
         self.assertEqual(in_scope, 0.83)
@@ -143,35 +168,29 @@ class TestRerank(unittest.TestCase):
             out = jev.rerank("Q", docs, keep=keep)
         return out, client
 
-    def test_orders_by_rank_not_string(self):
-        # Alphabetically "partiellement" > "oui" > "non"; rank must win.
+    def test_orders_by_score(self):
+        # Score is a 0..2 level index; higher confidence must not beat a higher score.
         docs = [FakeDoc("a"), FakeDoc("b"), FakeDoc("c")]
-        table = {"a": ("non", 0.99), "b": ("partiellement", 0.99), "c": ("oui", 0.10)}
+        table = {"a": (0.1, 0.99), "b": (1.2, 0.99), "c": (1.9, 0.10)}
         out, client = self._run(table, docs, keep=3)
         self.assertEqual([d.page_content for d in out], ["c", "b", "a"])
         self.assertEqual(client.system_one.call_count, 3)
 
-    def test_unknown_label_ranks_lowest(self):
-        docs = [FakeDoc("odd"), FakeDoc("no")]
-        table = {"odd": ("Oui", 0.99), "no": ("non", 0.5)}
-        out, _ = self._run(table, docs, keep=2)
-        self.assertEqual([d.page_content for d in out], ["odd", "no"])
-
     def test_confidence_tie_break(self):
         docs = [FakeDoc("low"), FakeDoc("high"), FakeDoc("mid")]
-        table = {"low": ("oui", 0.2), "high": ("oui", 0.9), "mid": ("oui", 0.5)}
+        table = {"low": (2.0, 0.2), "high": (2.0, 0.9), "mid": (2.0, 0.5)}
         out, _ = self._run(table, docs, keep=3)
         self.assertEqual([d.page_content for d in out], ["high", "mid", "low"])
 
     def test_keeps_only_keep(self):
         docs = [FakeDoc(str(i)) for i in range(6)]
         table = {
-            "0": ("non", 0.9),
-            "1": ("oui", 0.7),
-            "2": ("partiellement", 0.8),
-            "3": ("oui", 0.95),
-            "4": ("non", 0.1),
-            "5": ("partiellement", 0.3),
+            "0": (0.2, 0.9),
+            "1": (1.8, 0.7),
+            "2": (1.1, 0.8),
+            "3": (1.9, 0.95),
+            "4": (0.0, 0.1),
+            "5": (1.0, 0.3),
         }
         out, client = self._run(table, docs, keep=2)
         self.assertEqual([d.page_content for d in out], ["3", "1"])
@@ -179,7 +198,7 @@ class TestRerank(unittest.TestCase):
 
     def test_default_keep_is_4(self):
         docs = [FakeDoc(str(i)) for i in range(10)]
-        table = {str(i): ("oui", i / 10) for i in range(10)}
+        table = {str(i): (i / 5, 0.5) for i in range(10)}
         client = fake_client(
             side_effect=lambda *a, **k: relevance_result(
                 *table[extract_state(a, k)["extrait"]]
@@ -191,7 +210,7 @@ class TestRerank(unittest.TestCase):
 
     def test_returns_doc_objects(self):
         docs = [FakeDoc("x", page=3)]
-        out, _ = self._run({"x": ("oui", 0.5)}, docs, keep=4)
+        out, _ = self._run({"x": (2.0, 0.5)}, docs, keep=4)
         self.assertIs(out[0], docs[0])
 
     def test_empty_docs_no_client_call(self):
@@ -222,8 +241,7 @@ class TestAnswerQuestion(unittest.TestCase):
         self.docs = [FakeDoc("Art. 1 ...", page=12), FakeDoc("Art. 2 ...", page=40)]
         self.retriever = MagicMock(name="retriever")
         self.retriever.invoke.return_value = self.docs + [FakeDoc("noise", page=99)]
-        self.qa = MagicMock(name="question_answer_chain")
-        self.qa.invoke.return_value = "Réponse brute."
+        self.generate = MagicMock(name="generate", return_value="Réponse brute.")
 
     def _call(self, triage, grounded, rerank=None):
         rerank = rerank or MagicMock(return_value=self.docs)
@@ -233,7 +251,7 @@ class TestAnswerQuestion(unittest.TestCase):
             patch.object(rag_chain.jev, "rerank", rerank),
             patch.object(rag_chain.jev, "grounded", grounded_mock),
             patch.object(rag_chain, "retriever", self.retriever),
-            patch.object(rag_chain, "question_answer_chain", self.qa),
+            patch.object(rag_chain, "generate", self.generate),
         ):
             out = rag_chain.answer_question("Q?")
         return out, rerank, grounded_mock
@@ -250,7 +268,7 @@ class TestAnswerQuestion(unittest.TestCase):
         self.assertEqual(out["in_scope"], 0.2)
         self.assertIn("sensitivity", out)
         self.retriever.invoke.assert_not_called()
-        self.qa.invoke.assert_not_called()
+        self.generate.assert_not_called()
         rerank.assert_not_called()
         grounded.assert_not_called()
 
@@ -265,9 +283,12 @@ class TestAnswerQuestion(unittest.TestCase):
             set(out), {"answer", "in_scope", "grounded", "sensitivity", "sources"}
         )
         self.retriever.invoke.assert_called_once_with("Q?")
-        # rerank receives retrieved docs; QA gets reranked docs
+        # rerank receives retrieved docs; generate gets reranked docs
         self.assertEqual(rerank.call_args[0][0], "Q?")
-        self.qa.invoke.assert_called_once_with({"input": "Q?", "context": self.docs})
+        self.assertEqual(
+            list(rerank.call_args[0][1]), self.retriever.invoke.return_value
+        )
+        self.generate.assert_called_once_with("Q?", self.docs)
         g_args = grounded.call_args[0]
         self.assertEqual(g_args[0], "Q?")
         self.assertEqual(list(g_args[1]), self.docs)
@@ -305,7 +326,15 @@ class TestAnswerQuestion(unittest.TestCase):
         )
         self.assertIsNone(out["grounded"])
         self.assertEqual(out["sources"], [])
-        self.qa.invoke.assert_not_called()
+        self.generate.assert_not_called()
+        grounded.assert_not_called()
+
+    def test_claude_refusal_skips_grounding_and_warnings(self):
+        self.generate.return_value = rag_chain.REFUSAL_ANSWER
+        out, _, grounded = self._call(triage=(0.9, "élevé"), grounded=0.1)
+        self.assertEqual(out["answer"], rag_chain.REFUSAL_ANSWER)
+        self.assertIsNone(out["grounded"])
+        self.assertEqual(out["sources"], [])
         grounded.assert_not_called()
 
     def test_missing_page_metadata_gives_none(self):

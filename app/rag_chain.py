@@ -1,50 +1,34 @@
+import anthropic
 from dotenv import load_dotenv
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from . import jev
 
 load_dotenv()
 
+PDF_PATH = "Burundi_Code_2017_penal.pdf"
+PERSIST_DIR = "rag"
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CLAUDE_MODEL = "claude-opus-5-5"
+CLAUDE_EFFORT = "medium"
+MAX_TOKENS = 16000
 
-loader = PyPDFLoader("Burundi_Code_2017_penal.pdf")
-data = loader.load()  # entire PDF is loaded as a single Document
+IN_SCOPE_THRESHOLD = 0.5
+GROUNDED_THRESHOLD = 0.7
 
-# split data
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=600)
-docs = text_splitter.split_documents(data)
-# print(docs[200])
-# print("================================================")
-print("Total number of documents: ", len(docs))
-
-
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-vector = embeddings.embed_query("hello, world!")
-# vector[:5]
-
-
-vectorstore = Chroma.from_documents(
-    documents=docs, embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+REFUSAL_ANSWER = (
+    "Je ne peux pas répondre à cette question. Consultez un professionnel du droit."
 )
 
-retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
-
-# retrieved_docs = retriever.invoke("Selon l'article 1, qu'est-ce qu'une infraction ?")
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash-lite", temperature=1, max_tokens=500
-)
-
-
-system_prompt = (
+SYSTEM_PROMPT = (
     "Vous êtes un assistant juridique spécialisé dans le Code pénal du Burundi. "
     "Votre rôle est de fournir des informations précises et contextuelles sur le droit pénal burundais. "
     "RÈGLES DE RÉPONSE : "
     "• Utilisez UNIQUEMENT les extraits de contexte fournis pour formuler votre réponse "
+    "• Les extraits sont fournis dans la balise <extraits>, chacun précédé de son numéro de page "
     "• Citez toujours les articles spécifiques quand ils sont mentionnés dans le contexte "
     "• Si l'information n'est pas présente dans le contexte, indiquez clairement 'Je ne trouve pas cette information dans le contexte fourni' "
     "• Répondez de manière claire et précise en maximum 4 phrases "
@@ -61,23 +45,53 @@ system_prompt = (
     "LIMITATIONS : "
     "• Vous fournissez des informations juridiques, pas des conseils juridiques "
     "• Recommandez la consultation d'un professionnel du droit pour les cas spécifiques "
-    "CONTEXTE DU CODE PÉNAL : "
-    "\n\n"
-    "{context}"
 )
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ]
-)
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
+if not vectorstore.get(limit=1)["ids"]:
+    data = PyPDFLoader(PDF_PATH).load()  # un Document par page
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
+    vectorstore.add_documents(text_splitter.split_documents(data))
+
+retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
+
+_claude = None
 
 
-question_answer_chain = create_stuff_documents_chain(llm, prompt)
+def get_claude():
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic()  # lit ANTHROPIC_API_KEY
+    return _claude
 
-IN_SCOPE_THRESHOLD = 0.5
-GROUNDED_THRESHOLD = 0.7
+
+def format_context(docs) -> str:
+    extraits = "\n\n".join(
+        f"[page {d.metadata.get('page')}]\n{d.page_content}" for d in docs
+    )
+    return f"<extraits>\n{extraits}\n</extraits>"
+
+
+def generate(question: str, docs: list) -> str:
+    response = get_claude().beta.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        output_config={"effort": CLAUDE_EFFORT},
+        betas=["server-side-fallback-2026-07-01"],
+        extra_body={"fallbacks": "default"},
+        messages=[
+            {
+                "role": "user",
+                "content": f"{format_context(docs)}\n\nQuestion : {question}",
+            }
+        ],
+    )
+    if response.stop_reason == "refusal":
+        return REFUSAL_ANSWER
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return text or REFUSAL_ANSWER
 
 
 def answer_question(question: str) -> dict:
@@ -101,7 +115,15 @@ def answer_question(question: str) -> dict:
             "sensitivity": sensitivity,
             "sources": [],
         }
-    answer = question_answer_chain.invoke({"input": question, "context": docs})
+    answer = generate(question, docs)
+    if answer == REFUSAL_ANSWER:
+        return {
+            "answer": answer,
+            "in_scope": in_scope,
+            "grounded": None,
+            "sensitivity": sensitivity,
+            "sources": [],
+        }
     score = jev.grounded(question, docs, answer)
 
     if score < GROUNDED_THRESHOLD:

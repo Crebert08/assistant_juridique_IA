@@ -32,7 +32,8 @@ STUB_MODULES = [
     "langchain_core.documents",
     "langchain_core.output_parsers",
     "langchain_core.runnables",
-    # later phases
+    # phase 2: Claude + local HF embeddings
+    "anthropic",
     "langchain_anthropic",
     "langchain_huggingface",
     # web layer (not imported by tests, stubbed for safety)
@@ -42,20 +43,27 @@ STUB_MODULES = [
     "pydantic",
 ]
 
+_INSTALLED = {}  # name -> stub installed by this module
+
 
 def install_stubs(extra=()):
     """Insert MagicMock modules into sys.modules for STUB_MODULES + extra.
 
     Returns the dict of installed stubs (name -> mock) for inspection.
-    Always overwrites so tests are deterministic even if a real package
-    happens to be installed (we never want real PDF/LLM/network work).
+    Always overwrites real packages so tests are deterministic even if one
+    happens to be installed (we never want real PDF/LLM/network work), but
+    reuses a stub this module already installed: several test modules call
+    install_stubs() and must all see the same objects app/ was imported with.
     """
     installed = {}
     for name in list(STUB_MODULES) + list(extra):
-        mod = MagicMock(name=f"stub:{name}")
-        mod.__name__ = name
-        mod.__path__ = []  # make it look like a package
-        sys.modules[name] = mod
+        mod = _INSTALLED.get(name)
+        if mod is None or sys.modules.get(name) is not mod:
+            mod = MagicMock(name=f"stub:{name}")
+            mod.__name__ = name
+            mod.__path__ = []  # make it look like a package
+            sys.modules[name] = mod
+            _INSTALLED[name] = mod
         installed[name] = mod
     # Wire children as attributes of parents so `import a.b` + `a.b.X` works.
     for name, mod in installed.items():
