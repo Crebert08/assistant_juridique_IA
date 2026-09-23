@@ -4,6 +4,7 @@ langchain
 langchain_community
 langchain-text-splitters
 anthropic
+google-genai>=2.3.0
 langchain-huggingface
 python-dotenv
 streamlit
@@ -13,5 +14,5 @@ langchain_chroma
 langchainhub
 pypdf
 rapidocr-onnxruntime
-# TypeSafe Jev SDK - verify exact package name on docs.typesafe.ai
+# TypeSafe Jev SDK
 typesafe-sdk

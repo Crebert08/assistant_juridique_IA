@@ -1,3 +1,5 @@
+import os
+
 import anthropic
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,9 +14,55 @@ load_dotenv()
 PDF_PATH = "Burundi_Code_2017_penal.pdf"
 PERSIST_DIR = "rag"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_EFFORT = "medium"
 MAX_TOKENS = 16000
+
+# Choix du modèle via .env : LLM_PROVIDER, LLM_MODEL et LLM_EFFORT (facultatifs).
+# DeepSeek expose une API compatible Anthropic, d'où le même SDK ; Gemini a le sien.
+DEFAULT_PROVIDER = "gemini"
+PROVIDERS = {
+    "gemini": {
+        "base_url": None,
+        "api_key_env": "GEMINI_API_KEY",
+        "default_model": "gemini-3.8-flash",
+        "default_effort": "medium",  # thinking_level : low | medium | high
+        "models": None,
+    },
+    "anthropic": {
+        "base_url": None,
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "default_model": "claude-opus-5-5",
+        "default_effort": "medium",
+        "models": None,  # tout modèle Claude est accepté
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-v4-pro",
+        "default_effort": "high",
+        # DeepSeek remplace silencieusement un nom inconnu par deepseek-flash.
+        "models": {"deepseek-v4-pro", "deepseek-flash"},
+    },
+}
+
+
+def load_llm_config(env=os.environ) -> dict:
+    provider = env.get("LLM_PROVIDER", "").strip().lower() or DEFAULT_PROVIDER
+    if provider not in PROVIDERS:
+        raise ValueError(
+            f"LLM_PROVIDER={provider!r} inconnu. Valeurs possibles : {sorted(PROVIDERS)}"
+        )
+    spec = PROVIDERS[provider]
+    model = env.get("LLM_MODEL", "").strip() or spec["default_model"]
+    if spec["models"] is not None and model not in spec["models"]:
+        raise ValueError(
+            f"LLM_MODEL={model!r} invalide pour {provider}. "
+            f"Valeurs possibles : {sorted(spec['models'])}"
+        )
+    effort = env.get("LLM_EFFORT", "").strip() or spec["default_effort"]
+    return {"provider": provider, "model": model, "effort": effort, **spec}
+
+
+LLM = load_llm_config()
 
 IN_SCOPE_THRESHOLD = 0.5
 GROUNDED_THRESHOLD = 0.7
@@ -56,14 +104,25 @@ if not vectorstore.get(limit=1)["ids"]:
 
 retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
 
-_claude = None
+_llm_client = None
 
 
-def get_claude():
-    global _claude
-    if _claude is None:
-        _claude = anthropic.Anthropic()  # lit ANTHROPIC_API_KEY
-    return _claude
+def get_llm_client():
+    global _llm_client
+    if _llm_client is None:
+        api_key = os.environ.get(LLM["api_key_env"])
+        # Sans clé, le SDK se rabattrait sur ANTHROPIC_API_KEY : jamais vers un tiers.
+        if LLM["provider"] != "anthropic" and not api_key:
+            raise RuntimeError(f"{LLM['api_key_env']} manquant dans .env")
+        if LLM["provider"] == "gemini":
+            from google import genai  # import local : inutile pour les autres fournisseurs
+
+            _llm_client = genai.Client(api_key=api_key)
+        else:
+            _llm_client = anthropic.Anthropic(
+                api_key=api_key, base_url=LLM["base_url"]
+            )
+    return _llm_client
 
 
 def format_context(docs) -> str:
@@ -74,20 +133,37 @@ def format_context(docs) -> str:
 
 
 def generate(question: str, docs: list) -> str:
-    response = get_claude().beta.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        output_config={"effort": CLAUDE_EFFORT},
-        betas=["server-side-fallback-2026-07-01"],
-        extra_body={"fallbacks": "default"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"{format_context(docs)}\n\nQuestion : {question}",
-            }
-        ],
-    )
+    user_content = f"{format_context(docs)}\n\nQuestion : {question}"
+    client = get_llm_client()
+    if LLM["provider"] == "gemini":
+        interaction = client.interactions.create(
+            model=LLM["model"],
+            input=user_content,
+            system_instruction=SYSTEM_PROMPT,
+            generation_config={
+                "thinking_level": LLM["effort"],
+                "max_output_tokens": MAX_TOKENS,
+            },
+            store=False,  # Google conserve les échanges par défaut
+        )
+        return interaction.output_text or REFUSAL_ANSWER
+
+    request = {
+        "model": LLM["model"],
+        "max_tokens": MAX_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "output_config": {"effort": LLM["effort"]},
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    if LLM["provider"] == "anthropic":
+        # Repli serveur si un classifieur refuse ; propre à l'API Anthropic.
+        response = client.beta.messages.create(
+            **request,
+            betas=["server-side-fallback-2026-07-01"],
+            extra_body={"fallbacks": "default"},
+        )
+    else:
+        response = client.messages.create(**request)
     if response.stop_reason == "refusal":
         return REFUSAL_ANSWER
     text = "".join(b.text for b in response.content if b.type == "text")

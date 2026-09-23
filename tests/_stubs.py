@@ -36,6 +36,9 @@ STUB_MODULES = [
     "anthropic",
     "langchain_anthropic",
     "langchain_huggingface",
+    # Gemini provider (imported lazily by get_llm_client)
+    "google",
+    "google.genai",
     # web layer (not imported by tests, stubbed for safety)
     "fastapi",
     "fastapi.middleware",
